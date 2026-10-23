@@ -2,3 +2,4 @@ telebot
 requests
 playwright 
 asyncio
+base64
