@@ -1129,7 +1129,7 @@ if __name__ == "__main__":
 # BOT — Part 1 (will be continued in next message)
 # ═══════════════════════════════════════════════════════════════════
 
-TOKEN = '8689698569:AAF6GOOcFdsTnG_UXXHLqWkis0bCsIFsQJQ'
+TOKEN = '8689698569:AAFMkANucn1dgEaDc4vuO0bgA1fQV_iogaQ'
 OWNER_ID = 6843321125
 ADMINS = ['6843321125']
 
